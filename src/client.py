@@ -40,8 +40,8 @@ class RPCClient(object):
             try:
                 data = self._conn.recv(self._chunksize)
             except socket.timeout as t:
-                if self._stop:
-                    break
+                if not self._stop:
+                    continue
             if not data:
                 raise IOError("connection closed")
             self._unpacker.feed(data)
