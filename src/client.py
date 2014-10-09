@@ -18,32 +18,59 @@ class RPCClient(object):
         self._msgpool = dict()
         self._pack_encoding = pack_encoding
         self._unpack_encoding = unpack_encoding
-        self._packer = msgpack.Packer(encoding=pack_encoding)
-        self._unpacker = msgpack.Unpacker(encoding=unpack_encoding, use_list=False)
+        self._packer = msgpack.Packer(encoding=pack_encoding.encode("utf-8"))
+        self._unpacker = msgpack.Unpacker(encoding=unpack_encoding.encode("utf-8"), use_list=False)
         self._conn = None
         self._chunksize = chunksize
-        self._stop = False
+        self._connecting = False
         self._msgid = 0
         self._reading_worker = None
         self._sending_worker = None
+        self._conn_worker = gevent.spawn(self._conn_watching)
+        self._conn_worker.start()
 
-    def open(self):
-        self._stop = False
-        self._conn = socket.create_connection((self._host, self._port), timeout=self._timeout)
+    def _conn_watching(self):
+        while True:
+            self.try_open_connection()
+            gevent.sleep(1.0)
+
+    def try_open_connection(self):
+        if self._connecting or self._conn or (self._sendqueue.empty() and len(self._msgpool) == 0):
+            return
+        self._connecting = True
+        try:
+            self._conn = socket.create_connection((self._host, self._port), timeout=self._timeout)
+        except Exception as e:
+            logging.warning("create connection error. {}".format(e))
+            if self._conn:
+                self._conn.close()
+                self._conn = None
+            self._connecting = False
+            return
+        if not self._conn:
+            logging.warning("create connection to ({}:{}) failed.".format(self._host, self._port))
+            self._connecting = False
+            return
         self._reading_worker = gevent.spawn(self._reading)
         self._sending_worker = gevent.spawn(self._sending)
         self._reading_worker.start()
         self._sending_worker.start()
+        self._connecting = False
 
     def _reading(self):
-        while not self._stop:
+        while True:
             try:
                 data = self._conn.recv(self._chunksize)
             except socket.timeout as t:
-                if not self._stop:
-                    continue
+                continue
             if not data:
-                raise IOError("connection closed")
+                logging.warning("connection closed")
+                self._conn.close()
+                self._conn = None
+                self._connecting = False
+                self._sending_worker.kill()
+                gevent.spawn(self._conn_watching).start()
+                return
             self._unpacker.feed(data)
             while True:
                 try:
@@ -53,9 +80,20 @@ class RPCClient(object):
                 self._parse_rsp(rsp)
 
     def _sending(self):
-        while not self._stop:
+        while True:
             body = self._sendqueue.get()
-            self._conn.sendall(body)
+            try:
+                self._conn.sendall(body)
+            except Exception as e:
+                logging.warning("RPCClient._sending:error occured. {}".format(e))
+                self._conn.close()
+                self._conn = None
+                self._connecting = False
+                self._reading_worker.kill()
+                if not self._sendqueue.full():
+                    self._sendqueue.put(body)
+                gevent.spawn(self._conn_watching).start()
+                return
 
     def _parse_rsp(self, rsp):
         if type(rsp) != tuple or len(rsp) != 4 or rsp[0] != MSGPACKRPC_RSP:
@@ -65,15 +103,14 @@ class RPCClient(object):
             logging.warn("unexpected msgid. msgid = {}".format(msgid))
             return
         msgsit = self._msgpool[msgid]
+        del self._msgpool[msgid]
         msgsit[1] = error
         msgsit[2] = result
         msgsit[0].set()
                     
     def call(self, method, *args):
-        if not self._reading_worker:
-            self.open()
         if type(method) != str or type(args) != tuple:
-            raise Exception("invalid msgpack-rpc request")
+            raise Exception("invalid msgpack-rpc request, type(method)={}, type(args)={}".format(type(method), type(args)))
         self._msgid += 1
         msgid = self._msgid
         req = (MSGPACKRPC_REQ, msgid, method, args)
@@ -81,8 +118,8 @@ class RPCClient(object):
         msgsit = [Event(), None, None]
         self._msgpool[msgid] = msgsit
         self._sendqueue.put(body)
+        self.try_open_connection()
         r = msgsit[0].wait(timeout=self._timeout)
-        del self._msgpool[msgid]
         if not r:
             raise Exception("msgpack-rpc call timeout after {} seconds, msgid = {}".format(self._timeout, msgid))
         if msgsit[1]:
@@ -90,11 +127,13 @@ class RPCClient(object):
         return msgsit[2]
 
     def close(self):
-        self._stop = True
         if not self._reading_worker:
+            self._conn_worker.kill()
             self._reading_worker.kill()
             self._sending_worker.kill()
+            self._conn_worker = None
             self._reading_worker = None
             self._sending_worker = None
         self._conn.close()
         self._conn = None
+        self._connecting = False
