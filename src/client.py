@@ -69,7 +69,7 @@ class RPCClient(object):
                 self._conn = None
                 self._connecting = False
                 self._sending_worker.kill()
-                gevent.spawn(self._conn_watching).start()
+                gevent.spawn(self.try_open_connection).start()
                 return
             self._unpacker.feed(data)
             while True:
@@ -92,7 +92,7 @@ class RPCClient(object):
                 self._reading_worker.kill()
                 if not self._sendqueue.full():
                     self._sendqueue.put(body)
-                gevent.spawn(self._conn_watching).start()
+                gevent.spawn(self.try_open_connection).start()
                 return
 
     def _parse_rsp(self, rsp):
