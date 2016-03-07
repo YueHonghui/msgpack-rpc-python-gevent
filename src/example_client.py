@@ -12,7 +12,10 @@ def timer_call(ep):
 
 if __name__ == "__main__":
     sh = RPCHandle("client")
-    s = socket.create_connection(("127.0.0.1", 10000), timeout=10)
-    ep = MsgpackEndpoint(MODEBOTH, s, sh)
+    router = RpcRouter()
+    router.route_call(sh.echo)
+    print(router.get_calls())
+    s = socket.create_connection(("127.0.0.1", 11000), timeout=10)
+    ep = MsgpackEndpoint(MODEBOTH, s, router)
     gevent.spawn(timer_call, ep).start()
     gevent.sleep(100000.0)

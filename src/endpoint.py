@@ -14,9 +14,36 @@ MODECLIENT = 1
 MODESERVER = 2
 MODEBOTH = 3
 
+class RpcRouter(object):
+    def __init__(self):
+        self._notify_funcs = {}
+        self._call_funcs = {}
+
+    def route_notify(self, func, name=None):
+        if name == None:
+            name = func.__name__
+        self._notify_funcs[name] = func
+
+    def route_call(self, func, name=None):
+        if name == None:
+            name = func.__name__
+        self._call_funcs[name] = func
+
+    def get_notify(self, name):
+        return self._notify_funcs.get(name)
+
+    def get_call(self, name):
+        return self._call_funcs.get(name)
+
+    def get_calls(self):
+        return self._call_funcs.keys()
+
+    def get_notifies(self):
+        return self._notify_funcs.keys()
+
 class MsgpackEndpoint(object):
-    def __init__(self, mode, conn, dispatcher=None, timeout=5.0, poolsize=10, chunksize=1024*32, pack_encoding='utf-8', unpack_encoding='utf-8'):
-        self._dispatcher = dispatcher
+    def __init__(self, mode, conn, router=None, timeout=5.0, poolsize=10, chunksize=1024*32, pack_encoding='utf-8', unpack_encoding='utf-8'):
+        self._router = router
         self._mode = mode
         self._timeout = timeout
         self._poolsize = poolsize
@@ -84,12 +111,12 @@ class MsgpackEndpoint(object):
             msgsit[0].set()
         elif msg[0] == MSGPACKRPC_REQ and len(msg) == 4 and self._mode & MODESERVER:
             (_, msgid, method, params) = msg
+            func = self._router.get_call(method)
             result = None
-            if not hasattr(self._dispatcher, method):
+            if not func:
                 rsp = (MSGPACKRPC_RSP, msgid, "Method not found: {}".format(method), None)
                 self._sendqueue.put(self._packer.pack(rsp))
                 return
-            func = getattr(self._dispatcher, method)
             if not hasattr(func, '__call__'):
                 rsp = (MSGPACKRPC_RSP, msgid, "Method is not callable: {}".format(method), None)
                 self._sendqueue.put(self._packer.pack(rsp))
@@ -104,10 +131,10 @@ class MsgpackEndpoint(object):
             self._sendqueue.put(self._packer.pack(rsp))
         elif msg[0] == MSGPACKRPC_NOTIFY and len(msg) == 3 and self._mode & MODESERVER:
             (_, method, params) = msg
-            if not hasattr(self._dispatcher, method):
+            func = self._router.get_notify(method)
+            if not func:
                 logging.warn("Method not found: {}".format(method))
                 return
-            func = getattr(self, method)
             if not hasattr(func, '__call__'):
                 logging.warn("Method is not callable: {}".format(method))
                 return
@@ -118,7 +145,6 @@ class MsgpackEndpoint(object):
                 return
         else:
             raise Exception("invalid msgpack-rpc msg {}".format(msg))
-
                     
     def call(self, method, *args):
         if not self._conn:
