@@ -16,6 +16,7 @@ if __name__ == "__main__":
     router.route_call(sh.echo)
     print(router.get_calls())
     s = socket.create_connection(("127.0.0.1", 11000), timeout=10)
-    ep = MsgpackEndpoint(MODEBOTH, s, router)
+    connerror = ConnErrorReconnect()
+    ep = MsgpackEndpoint(MODEBOTH, s, connerror, router)
     gevent.spawn(timer_call, ep).start()
     gevent.sleep(100000.0)

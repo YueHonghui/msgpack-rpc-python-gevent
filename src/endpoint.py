@@ -14,6 +14,33 @@ MODECLIENT = 1
 MODESERVER = 2
 MODEBOTH = 3
 
+class IConnErrorHandle(object):
+    def on_conn_error(self, conn, ep, exception):
+        raise Exception("not implemented!")
+
+class ConnErrorReconnect(IConnErrorHandle):
+    def __init__(self, addr=None, interval=2.0, timeout=5.0):
+        self.addr = addr
+        self.interval = interval
+        self.timeout = timeout
+
+    def on_conn_error(self, conn, ep, exception):
+        logging.warn("conn closed. error={}".format(exception))
+        addr = self.addr
+        if not self.addr:
+            addr = conn.getpeername()
+        conn.close()
+        while True:
+            try:
+                conn = socket.create_connection(addr, timeout=self.timeout)
+            except Exception as e:
+                logging.warn("try to reconnect to {} failed. error={}".format(addr, e))
+                gevent.sleep(self.interval)
+                continue
+            while not ep.attach_conn(conn):
+                gevent.sleep(1.0)
+            return
+
 class RpcRouter(object):
     def __init__(self):
         self._notify_funcs = {}
@@ -42,8 +69,9 @@ class RpcRouter(object):
         return self._notify_funcs.keys()
 
 class MsgpackEndpoint(object):
-    def __init__(self, mode, conn, router=None, timeout=5.0, poolsize=10, chunksize=1024*32, pack_encoding='utf-8', unpack_encoding='utf-8'):
+    def __init__(self, mode, conn, conn_error_handle, router=None, timeout=5.0, poolsize=10, chunksize=1024*32, pack_encoding='utf-8', unpack_encoding='utf-8'):
         self._router = router
+        self._conn_error_handle = conn_error_handle
         self._mode = mode
         self._timeout = timeout
         self._poolsize = poolsize
@@ -51,8 +79,8 @@ class MsgpackEndpoint(object):
         self._msgpool = dict()
         self._pack_encoding = pack_encoding
         self._unpack_encoding = unpack_encoding
-        self._packer = msgpack.Packer(encoding=pack_encoding.encode("utf-8"))
-        self._unpacker = msgpack.Unpacker(encoding=unpack_encoding.encode("utf-8"), use_list=False)
+        self._packer = msgpack.Packer(use_bin_type=True, encoding=pack_encoding.encode("utf-8"))
+        self._unpacker = msgpack.Unpacker(encoding=unpack_encoding.encode("utf-8"))
         self._conn = conn
         self._chunksize = chunksize
         self._connecting = False
@@ -64,16 +92,19 @@ class MsgpackEndpoint(object):
 
     def _reading(self):
         while True:
+            if not self._conn:
+                gevent.sleep(1.0)
+                continue
             try:
                 data = self._conn.recv(self._chunksize)
             except socket.timeout as t:
                 continue
             if not data:
                 logging.warning("connection closed")
-                self._conn.close()
+                tmpconn = self._conn
                 self._conn = None
-                self._sending_worker.kill()
-                return
+                self._conn_error_handle.on_conn_error(tmpconn, self, Exception("connection closed"))
+                continue
             self._unpacker.feed(data)
             while True:
                 try:
@@ -84,21 +115,28 @@ class MsgpackEndpoint(object):
 
     def _sending(self):
         while True:
+            if not self._conn:
+                gevent.sleep(1.0)
+                continue
             body = self._sendqueue.get()
             try:
                 self._conn.sendall(body)
             except Exception as e:
                 logging.warning("RPCClient._sending:error occured. {}".format(e))
-                self._conn.close()
+                tmpconn = self._conn
                 self._conn = None
-                self._reading_worker.kill()
                 if not self._sendqueue.full():
                     self._sendqueue.put(body)
-                return
+                self._conn_error_handle.on_conn_error(tmpconn, self, e)
+                continue
 
     def _parse_msg(self, msg):
-        if type(msg) != tuple or len(msg) < 3:
-            raise Exception("invalid msgpack-rpc msg")
+        if (type(msg) != list and type(msg) != tuple) or len(msg) < 3:
+            logging.warn("invalid msgpack-rpc msg. type={}, msg={}".format(type(msg), msg))
+            tmpconn = self._conn
+            self._conn = None
+            self._conn_error_handle.on_conn_error(tmpconn, self, Exception("invalid msgpack-rpc msg"))
+            return
         if msg[0] == MSGPACKRPC_RSP and len(msg) == 4 and self._mode & MODECLIENT:
             (_, msgid, error, result) = msg
             if msgid not in self._msgpool:
@@ -144,11 +182,21 @@ class MsgpackEndpoint(object):
                 logging.warn("Exception: {} in notify {}".format(e, method))
                 return
         else:
-            raise Exception("invalid msgpack-rpc msg {}".format(msg))
+            logging.warn("invalid msgpack-rpc msg {}".format(msg))
+            tmpconn = self._conn
+            self._conn = None
+            self._conn_error_handle.on_conn_error(tmpconn, self, Exception("invalid msgpack-rpc msg"))
+            return
+
+    def attach_conn(self, conn):
+        if self._conn:
+            return False
+        self._conn = conn
+        return True
                     
     def call(self, method, *args):
         if not self._conn:
-            raise Exception("endpoint conn closed")
+            logging.warn("rpc connection closed")
         if type(method) != str or type(args) != tuple:
             raise Exception("invalid msgpack-rpc request, type(method)={}, type(args)={}".format(type(method), type(args)))
         self._msgid += 1
@@ -167,7 +215,7 @@ class MsgpackEndpoint(object):
 
     def notify(self, method, *args):
         if not self._conn:
-            raise Exception("endpoint conn closed")
+            logging.warn("rpc connection closed")
         if type(method) != str or type(args) != tuple:
             raise Exception("invalid msgpack-rpc request, type(method)={}, type(args)={}".format(type(method), type(args)))
         notify = (MSGPACKRPC_NOTIFY, method, args)
@@ -181,5 +229,4 @@ class MsgpackEndpoint(object):
             self._sending_worker.kill()
             self._sending_worker = None
         if self._conn:
-            self._conn.close()
             self._conn = None
